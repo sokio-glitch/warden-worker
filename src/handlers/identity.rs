@@ -40,6 +40,8 @@ pub struct TokenResponse {
     force_password_reset: bool,
     #[serde(rename = "UserDecryptionOptions")]
     user_decryption_options: UserDecryptionOptions,
+    #[serde(rename = "Culture")]
+    culture: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +110,7 @@ fn generate_tokens_and_response(
             has_master_password: true,
             object: "userDecryptionOptions".to_string(),
         },
+        culture: "zh-CN".to_string(),
     }))
 }
 
