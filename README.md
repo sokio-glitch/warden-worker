@@ -90,7 +90,7 @@ There are no immediate plans to implement these features. The primary goal of th
 
     This will deploy the worker and set up the necessary database tables.
 
-5. **Set environment variables**
+5. **Set environment variables** as `Secret`
    
 - `ALLOWED_EMAILS` your-email@example.com
 - `JWT_SECRET` a long random string
@@ -99,6 +99,123 @@ There are no immediate plans to implement these features. The primary goal of th
 6.  **Configure your Bitwarden client:**
 
     In your Bitwarden client, go to the self-hosted login screen and enter the URL of your deployed worker (e.g., `https://warden-worker.your-username.workers.dev`).
+
+### CI/CD Deployment with GitHub Actions
+
+This project includes GitHub Actions workflows for automated deployment. This is the recommended approach for production environments as it ensures consistent builds and deployments.
+
+#### Required Secrets
+
+Add the following secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `CLOUDFLARE_API_TOKEN` | yes | Your Cloudflare API token |
+| `CLOUDFLARE_ACCOUNT_ID` | yes | Your Cloudflare account ID |
+| `D1_DATABASE_ID` | yes | Your production D1 database ID |
+
+> ⚠️ **Important:** The `CLOUDFLARE_API_TOKEN` must have **both** Worker and D1 permissions:
+> - **Edit Cloudflare Workers** - Required for deploying the Worker
+> - **Edit D1** - Required for database migrations and backups
+> 
+> When creating the API token in Cloudflare Dashboard, make sure to add both permissions under "Account" → "Cloudflare Workers" and "Account" → "D1".
+
+#### How to Get Your Cloudflare Account ID
+
+1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/)
+2. Select your account
+3. Your Account ID is displayed in the right sidebar of the Overview page, or in the URL: `https://dash.cloudflare.com/<account-id>`
+
+#### Usage
+
+1.  **Fork or clone the repository** to your GitHub account
+
+2.  **Configure the required secrets** in your repository settings
+
+3.  **Manually trigger the `Build` Action** from the GitHub Actions tab in your repository
+
+4.  **Monitor the deployment** in the Actions tab of your repository
+
+5.  **Set environment variables** in the Cloudflare console (following the command line deployment steps):
+    - `ALLOWED_EMAILS` your-email@example.com
+    - `JWT_SECRET` a long random string
+    - `JWT_REFRESH_SECRET` a long random string
+
+### Deploying the Frontend
+
+The Bitwarden web vault frontend can be deployed to Cloudflare Pages separately. This project uses [bw_web_builds](https://github.com/dani-garcia/bw_web_builds) (the Vaultwarden web vault builds) as the frontend.
+
+> ⚠️ **Important:** The web vault frontend comes from Vaultwarden and therefore **exposes many advanced UI features**, but most of them are **non-functional** because Warden Worker's backend intentionally does **NOT** implement the corresponding APIs. In practice, it mainly provides bulk management capabilities that aren't available in browser extensions. The following features (among others) are not supported:
+> - Sharing vaults
+> - Device management
+> - Organizations
+> - Send functionality
+> - Emergency access
+> - Admin console features
+> - And many other advanced Bitwarden features
+
+#### Step 1: Deploy to Cloudflare Pages
+
+1. **Ensure the required secrets are configured** (same secrets as backend deployment):
+   - `CLOUDFLARE_API_TOKEN`
+   - `CLOUDFLARE_ACCOUNT_ID`
+
+2. **Manually trigger the deployment:**
+   - Go to your GitHub repository → **Actions** tab
+   - Find the **"Deploy Frontend"** workflow
+   - Click **"Run workflow"** → **"Run workflow"**
+   - The workflow will download the latest web vault release and deploy it to Cloudflare Pages with project name `warden-frontend`
+
+#### Step 2: Configure Custom Domain in Cloudflare Console
+
+After deploying, you need to configure custom domains to connect the frontend (Pages) and backend (Worker):
+
+1. **Set a custom domain for the frontend (Cloudflare Pages):**
+   - Log in to [Cloudflare Dashboard](https://dash.cloudflare.com/)
+   - Go to **Workers & Pages** → Select your `warden-frontend` project
+   - Click **Custom domains** tab → **Set up a custom domain**
+   - Enter your desired domain (e.g., `vault.example.com`)
+   - Follow the prompts to add DNS records and verify the domain
+
+2. **Add Worker routes for API endpoints:**
+   
+   The frontend needs to communicate with the backend Worker via `/api/*` and `/identity/*` paths. You need to add routes to your Worker:
+   
+   - Go to **Workers & Pages** → Select your `warden-worker` (backend Worker)
+   - Click **Settings** → **Domains & Routes**
+   - Click **Add** → **Route**
+   - Add the following routes (replace `vault.example.com` with your domain):
+     - Route: `vault.example.com/api/*` → Select your Worker
+     - Route: `vault.example.com/identity/*` → Select your Worker
+   - Make sure the **Zone** matches your domain's zone
+
+   > **Note:** The routes ensure that API requests from the frontend are handled by your Worker backend, while all other requests are served by Cloudflare Pages.
+
+#### Step 3: Configure Rate Limiting (Recommended)
+
+To protect your authentication endpoints from brute force attacks, it's highly recommended to configure rate limiting rules:
+
+1. **Navigate to Security Settings:**
+   - In Cloudflare Dashboard, select your domain (e.g., `example.com`)
+   - Go to **Security** → **WAF** → **Rate limiting rules**
+
+2. **Create a rate limiting rule:**
+   - Click **Create rule**
+   - **Rule name:** `Limit Identity API`
+   - **If incoming requests match...** 
+     - Field: `URI Path`
+     - Operator: `starts with`
+     - Value: `/identity/`
+   - **Then take action:**
+     - Choose action: `Block` or `Managed Challenge`
+     - **Rate limit:** Set requests per period (e.g., `10 requests per 1 minute`)
+   - Click **Deploy**
+
+   > **Tip:** You can also use the expression builder with: `(starts_with(http.request.uri.path, "/identity/"))`
+
+3. **Optional - Additional security rules:**
+   - Consider adding similar rules for `/api/accounts/` endpoints
+   - You may also enable **Bot Fight Mode** under Security → Bots for additional protection
 
 ## Configuration
 
@@ -118,11 +235,19 @@ You can configure the following environment variables in `wrangler.toml` under t
 
 *   **`IMPORT_BATCH_SIZE`** (Optional, Default: `30`)
     
-    Number of records to process in each batch when importing data. This helps manage memory usage and processing time for large imports.
+    Number of records to process in each batch when importing and deleting data. This helps manage memory usage and processing time for large imports.
     
     *   Set to `0` to disable batching (all records imported in a single batch)
     *   Defaults to `30` records per batch if not specified
     *   Example: `IMPORT_BATCH_SIZE = "50"` to process 50 records per batch
+
+*   **`DISABLE_USER_REGISTRATION`** (Optional, Default: `true`)
+    
+    Controls whether the "Create Account" / registration button is displayed in the Bitwarden client UI.
+    
+    *   Set to `false` to show the registration button
+    *   Defaults to `true` (hide registration button)
+    *   **Note:** This setting only affects the client UI display. It does NOT affect the actual registration functionality on the server side.
 
 ### Scheduled Tasks (Cron)
 
@@ -134,6 +259,8 @@ The worker includes a scheduled task that runs automatically to clean up soft-de
 You can modify the cron schedule in `wrangler.toml` if you want to run the cleanup task at a different time or frequency. See [Cloudflare Cron Triggers documentation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) for cron expression syntax.
 
 ### Database Backup (GitHub Actions)
+
+> ⚠️ **Note:** To use this backup feature, you must fork this repository and configure the same three required secrets as described in the [CI/CD Deployment ](#cicd-deployment-with-github-actions) section in advance: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `D1_DATABASE_ID`.
 
 This project includes a GitHub Action workflow that automatically backs up your D1 database to S3-compatible storage daily. The backup runs at 04:00 UTC (1 hour after the cleanup task).
 
@@ -244,6 +371,47 @@ To restore your D1 database from a backup:
     ```
 
     > **Note:** The `--remote` flag is required to execute against your production D1 database. Without it, the command will run against the local development database. 
+
+    > ⚠️ **Troubleshooting: `no such table: main.users` error**
+    > 
+    > If you encounter this error when importing, it's because `wrangler d1 export` may output tables in an order that doesn't respect foreign key dependencies (e.g., `folders` table is created before `users` table, but `folders` has a foreign key referencing `users`).
+    > 
+    > **Solution:** Add `PRAGMA foreign_keys=OFF;` at the beginning of your backup.sql file to disable foreign key checks during import:
+    > 
+    > ```bash
+    > # Prepend the PRAGMA statement to your backup file
+    > echo -e "PRAGMA foreign_keys=OFF;\n$(cat backup.sql)" > backup.sql
+    > 
+    > # Then import as usual
+    > wrangler d1 execute DATABASE_NAME --remote --file=backup.sql
+    > ```
+    > 
+    > Alternatively, you can manually reorder the SQL statements in the backup file to ensure parent tables (`users`) are created before child tables (`folders`, `ciphers`).
+
+#### D1 Time Travel (Point-in-Time Recovery)
+
+Cloudflare D1 provides a built-in Time Travel feature that allows you to restore your database to any point within the last 30 days. This is useful for undoing accidental data modifications or deletions without needing a backup.
+
+To use Time Travel:
+
+1.  **Check current restore bookmark:**
+
+    ```bash
+    # Replace DATABASE_NAME with your actual database name (e.g., warden-db)
+    wrangler d1 time-travel info DATABASE_NAME
+    ```
+
+2.  **Restore to a specific timestamp:**
+
+    ```bash
+    # Restore to a specific point in time (ISO 8601 format)
+    wrangler d1 time-travel restore DATABASE_NAME --timestamp=2024-01-15T12:00:00Z
+    
+    # Or restore to a specific bookmark
+    wrangler d1 time-travel restore DATABASE_NAME --bookmark=<bookmark_id>
+    ```
+
+> **Note:** Time Travel retains data for 30 days on the free tier. See [Cloudflare D1 Time Travel documentation](https://developers.cloudflare.com/d1/reference/time-travel/) for more details.
 
 ### Local Development with D1
 

@@ -1,3 +1,4 @@
+use axum::Extension;
 use tower_http::cors::{Any, CorsLayer};
 use tower_service::Service;
 use worker::*;
@@ -10,6 +11,10 @@ mod handlers;
 mod models;
 mod router;
 
+/// Base URL extracted from the incoming request, used for config endpoint.
+#[derive(Clone)]
+pub struct BaseUrl(pub String);
+
 #[event(fetch)]
 pub async fn main(
     req: HttpRequest,
@@ -20,13 +25,23 @@ pub async fn main(
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Debug);
 
+    // Extract base URL from request URI
+    let uri = req.uri();
+    let base_url = format!(
+        "{}://{}",
+        uri.scheme_str().unwrap_or("https"),
+        uri.authority().map(|a| a.as_str()).unwrap_or("localhost")
+    );
+
     // Allow all origins for CORS, which is typical for a public API like Bitwarden's.
     let cors = CorsLayer::new()
         .allow_methods(Any)
         .allow_headers(Any)
         .allow_origin(Any);
 
-    let mut app = router::api_router(env).layer(cors);
+    let mut app = router::api_router(env)
+        .layer(Extension(BaseUrl(base_url)))
+        .layer(cors);
 
     Ok(app.call(req).await?)
 }

@@ -1,9 +1,10 @@
+use super::get_batch_size;
 use axum::{extract::State, Json};
 use chrono::Utc;
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
-use worker::{query, Env};
+use worker::{query, D1PreparedStatement, Env};
 
 use crate::auth::Claims;
 use crate::db;
@@ -25,13 +26,7 @@ pub async fn create_cipher(
     let cipher_data = CipherData {
         name: cipher_data_req.name,
         notes: cipher_data_req.notes,
-        login: cipher_data_req.login,
-        card: cipher_data_req.card,
-        identity: cipher_data_req.identity,
-        secure_note: cipher_data_req.secure_note,
-        fields: cipher_data_req.fields,
-        password_history: cipher_data_req.password_history,
-        reprompt: cipher_data_req.reprompt,
+        type_fields: cipher_data_req.type_fields,
     };
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
@@ -42,7 +37,7 @@ pub async fn create_cipher(
         organization_id: cipher_data_req.organization_id.clone(),
         r#type: cipher_data_req.r#type,
         data: data_value,
-        favorite: cipher_data_req.favorite,
+        favorite: cipher_data_req.favorite.unwrap_or(false),
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: None,
         created_at: now.clone(),
@@ -78,6 +73,8 @@ pub async fn create_cipher(
     .run()
     .await?;
 
+    db::touch_user_updated_at(&db, &claims.sub).await?;
+
     Ok(Json(cipher))
 }
 
@@ -108,13 +105,7 @@ pub async fn update_cipher(
     let cipher_data = CipherData {
         name: cipher_data_req.name,
         notes: cipher_data_req.notes,
-        login: cipher_data_req.login,
-        card: cipher_data_req.card,
-        identity: cipher_data_req.identity,
-        secure_note: cipher_data_req.secure_note,
-        fields: cipher_data_req.fields,
-        password_history: cipher_data_req.password_history,
-        reprompt: cipher_data_req.reprompt,
+        type_fields: cipher_data_req.type_fields,
     };
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
@@ -125,7 +116,7 @@ pub async fn update_cipher(
         organization_id: cipher_data_req.organization_id.clone(),
         r#type: cipher_data_req.r#type,
         data: data_value,
-        favorite: cipher_data_req.favorite,
+        favorite: cipher_data_req.favorite.unwrap_or(false),
         folder_id: cipher_data_req.folder_id.clone(),
         deleted_at: None,
         created_at: existing_cipher.created_at,
@@ -153,6 +144,8 @@ pub async fn update_cipher(
     ).map_err(|_|AppError::Database)?
     .run()
     .await?;
+
+    db::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }
@@ -186,6 +179,8 @@ pub async fn soft_delete_cipher(
     .run()
     .await?;
 
+    db::touch_user_updated_at(&db, &claims.sub).await?;
+
     Ok(Json(()))
 }
 
@@ -198,19 +193,25 @@ pub async fn soft_delete_ciphers_bulk(
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&env)?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let batch_size = get_batch_size(&env);
+    let mut statements: Vec<D1PreparedStatement> = Vec::with_capacity(payload.ids.len());
 
     for id in payload.ids {
-        query!(
+        let stmt = query!(
             &db,
             "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
             now,
             id,
             claims.sub
         )
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await?;
+        .map_err(|_| AppError::Database)?;
+
+        statements.push(stmt);
     }
+
+    db::execute_in_batches(&db, statements, batch_size).await?;
+
+    db::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -235,6 +236,8 @@ pub async fn hard_delete_cipher(
     .run()
     .await?;
 
+    db::touch_user_updated_at(&db, &claims.sub).await?;
+
     Ok(Json(()))
 }
 
@@ -246,18 +249,24 @@ pub async fn hard_delete_ciphers_bulk(
     Json(payload): Json<CipherIdsData>,
 ) -> Result<Json<()>, AppError> {
     let db = db::get_db(&env)?;
+    let batch_size = get_batch_size(&env);
+    let mut statements: Vec<D1PreparedStatement> = Vec::with_capacity(payload.ids.len());
 
     for id in payload.ids {
-        query!(
+        let stmt = query!(
             &db,
             "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",
             id,
             claims.sub
         )
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await?;
+        .map_err(|_| AppError::Database)?;
+
+        statements.push(stmt);
     }
+
+    db::execute_in_batches(&db, statements, batch_size).await?;
+
+    db::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(()))
 }
@@ -297,6 +306,8 @@ pub async fn restore_cipher(
     .await?
     .ok_or(AppError::NotFound("Cipher not found".to_string()))?;
 
+    db::touch_user_updated_at(&db, &claims.sub).await?;
+
     Ok(Json(cipher_db.into()))
 }
 
@@ -318,37 +329,47 @@ pub async fn restore_ciphers_bulk(
 ) -> Result<Json<BulkRestoreResponse>, AppError> {
     let db = db::get_db(&env)?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let batch_size = get_batch_size(&env);
+    let ids = payload.ids;
 
-    let mut restored_ciphers = Vec::new();
+    if ids.is_empty() {
+        return Ok(Json(BulkRestoreResponse {
+            data: vec![],
+            object: "list".to_string(),
+            continuation_token: None,
+        }));
+    }
 
-    for id in payload.ids {
-        // Update the cipher to clear deleted_at
-        query!(
+    // Batch UPDATE operations
+    let mut update_statements: Vec<D1PreparedStatement> = Vec::with_capacity(ids.len());
+    for id in ids.iter() {
+        let stmt = query!(
             &db,
             "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
             now,
-            id,
+            id.clone(),
             claims.sub
         )
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await?;
+        .map_err(|_| AppError::Database)?;
 
-        // Fetch the restored cipher
-        let cipher_db: Option<crate::models::cipher::CipherDBModel> = query!(
-            &db,
-            "SELECT * FROM ciphers WHERE id = ?1 AND user_id = ?2",
-            id,
-            claims.sub
-        )
-        .map_err(|_| AppError::Database)?
-        .first(None)
-        .await?;
-
-        if let Some(cipher) = cipher_db {
-            restored_ciphers.push(cipher.into());
-        }
+        update_statements.push(stmt);
     }
+    db::execute_in_batches(&db, update_statements, batch_size).await?;
+
+    // Batch SELECT using json_each() - avoid N+1 query problem
+    let ids_json = serde_json::to_string(&ids).map_err(|_| AppError::Internal)?;
+
+    let restored_ciphers: Vec<Cipher> = db
+        .prepare("SELECT * FROM ciphers WHERE user_id = ?1 AND id IN (SELECT value FROM json_each(?2))")
+        .bind(&[claims.sub.clone().into(), ids_json.into()])?
+        .all()
+        .await?
+        .results::<crate::models::cipher::CipherDBModel>()?
+        .into_iter()
+        .map(|cipher| cipher.into())
+        .collect();
+
+    db::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(BulkRestoreResponse {
         data: restored_ciphers,
@@ -373,13 +394,7 @@ pub async fn create_cipher_simple(
     let cipher_data = CipherData {
         name: payload.name,
         notes: payload.notes,
-        login: payload.login,
-        card: payload.card,
-        identity: payload.identity,
-        secure_note: payload.secure_note,
-        fields: payload.fields,
-        password_history: payload.password_history,
-        reprompt: payload.reprompt,
+        type_fields: payload.type_fields,
     };
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
@@ -390,7 +405,7 @@ pub async fn create_cipher_simple(
         organization_id: payload.organization_id.clone(),
         r#type: payload.r#type,
         data: data_value,
-        favorite: payload.favorite,
+        favorite: payload.favorite.unwrap_or(false),
         folder_id: payload.folder_id.clone(),
         deleted_at: None,
         created_at: now.clone(),
@@ -420,6 +435,8 @@ pub async fn create_cipher_simple(
     ).map_err(|_| AppError::Database)?
     .run()
     .await?;
+
+    db::touch_user_updated_at(&db, &claims.sub).await?;
 
     Ok(Json(cipher))
 }

@@ -1,46 +1,33 @@
 use serde::Deserialize;
-use serde_json::Value;
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportCipher {
-    #[serde(rename = "type")]
-    pub r#type: i32,
-    pub folder_id: Option<String>,
-    pub organization_id: Option<String>,
-    pub name: String,
-    pub notes: Option<String>,
-    pub favorite: bool,
-    pub login: Option<Value>,
-    pub card: Option<Value>,
-    pub identity: Option<Value>,
-    pub secure_note: Option<Value>,
-    pub fields: Option<Value>,
-    pub password_history: Option<Value>,
-    pub reprompt: Option<i32>,
-    pub last_known_revision_date: Option<String>,
-    pub encrypted_for: String,
-}
+use crate::models::cipher::CipherRequestData;
 
-
+/// Folder data structure for import requests.
+/// Aligned with vaultwarden's FolderData.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportFolder {
-    pub id: String,
+    /// Optional folder ID - if provided and exists, the existing folder is used
+    pub id: Option<String>,
     pub name: String,
 }
 
+/// Relationship between cipher index and folder index in the import arrays.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderRelationship {
+    /// Cipher index in the ciphers array
     pub key: usize,
+    /// Folder index in the folders array
     pub value: usize,
 }
 
+/// Import request payload structure.
+/// Aligned with vaultwarden's ImportData used in POST /ciphers/import.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportRequest {
-    pub ciphers: Vec<ImportCipher>,
+    pub ciphers: Vec<CipherRequestData>,
     pub folders: Vec<ImportFolder>,
     #[serde(default)]
     pub folder_relationships: Vec<FolderRelationship>,
